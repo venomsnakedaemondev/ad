@@ -16,6 +16,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "functions", "paquetes.json")
 LOCK_FILE = "/tmp/arch_pkg_helper.lock"
 PACMAN_LOCK = "/var/lib/pacman/db.lck"
+PARU_URL = "https://aur.archlinux.org/paru-bin.git"
 TEMP_DIR = "/tmp/paru_install"
 
 # Configuración de logging
@@ -40,7 +41,12 @@ class PackageManager:
             sys.exit(1)
 
     def log(self, message, level="info"):
-        getattr(logging, level)(message)
+        # Cambié success por info para el color verde
+        if level == "success":
+            logging.info(message)
+        else:
+            getattr(logging, level)(message)
+        
         colors = {
             'info': Fore.CYAN,
             'warning': Fore.YELLOW,
@@ -89,7 +95,7 @@ class PackageManager:
                 if not line and process.poll() is not None:
                     break
                 if line and show_output:
-                    print(Fore.YELLOW + line.strip())
+                    print(Fore.BLUE + line.strip())
                     output.append(line)
                     sys.stdout.flush()
 
@@ -107,7 +113,7 @@ class PackageManager:
         for attempt in range(1, 4):
             self.log(f"Intento {attempt}/3 para {package}")
             if is_aur:
-                cmd = ["./install_aur.sh", package]
+                cmd = ["paru", "-S", "--noconfirm", package]
             else:
                 cmd = ["sudo", "pacman", "-S", "--noconfirm", package]
             code, _ = self.run_command(cmd, show_output=False)
@@ -116,10 +122,63 @@ class PackageManager:
             time.sleep(2)
         return False
 
+    def install_paru(self):
+        if self.run_command(["paru", "--version"])[0] == 0:
+            return True
+
+        self.log("Instalando paru desde AUR...", "info")
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            os.chdir(TEMP_DIR)
+
+            if not self._install_paru_dependencies():
+                return False
+
+            if not self._build_paru():
+                return False
+
+            if self.run_command(["paru", "--version"])[0] == 0:
+                self.log("✓ Paru instalado correctamente", "success")
+                return True
+            else:
+                self.log("✗ La instalación de paru falló", "error")
+                return False
+
+        except Exception as e:
+            self.log(f"Error durante la instalación de paru: {str(e)}", "error")
+            return False
+        finally:
+            shutil.rmtree(TEMP_DIR, ignore_errors=True)
+            os.chdir(BASE_DIR)
+
+    def _install_paru_dependencies(self):
+        deps = ["git", "base-devel"]
+        self.log("Instalando dependencias necesarias...", "info")
+
+        for dep in deps:
+            if self.run_command(["pacman", "-Qi", dep])[0] != 0:
+                if self.run_command(["sudo", "pacman", "-S", "--noconfirm", "--needed", dep])[0] != 0:
+                    self.log(f"✗ No se pudo instalar la dependencia: {dep}", "error")
+                    return False
+        return True
+
+    def _build_paru(self):
+        commands = [
+            ["git", "clone", PARU_URL, "."],
+            ["makepkg", "-si", "--noconfirm"],
+            ["sudo", "pacman", "-U", "--noconfirm", "paru-bin*.pkg.tar.zst"]
+        ]
+
+        for cmd in commands:
+            if self.run_command(cmd)[0] != 0:
+                self.log(f"✗ Fallo en el comando: {' '.join(cmd)}", "error")
+                return False
+        return True
+
     def show_progress(self, current, total, pkg_name, stage, status=""):
         percent = (current/total)*100
         bar = '█' * int(percent/2) + '-' * (50 - int(percent/2))
-        stage_color = Fore.MAGENTA
+        stage_color = Fore.BLUE if stage == "Pacman" else Fore.MAGENTA
         status_color = Fore.GREEN if "✓" in status else Fore.RED if "✗" in status else Fore.YELLOW
 
         sys.stdout.write(
@@ -158,13 +217,19 @@ class PackageManager:
                 time.sleep(0.5)
 
         if aur_pkgs:
+            if not self.install_paru():
+                return False
+
             self.log(f"\nInstalando {len(aur_pkgs)} paquetes AUR...", "info")
             for idx, pkg in enumerate(aur_pkgs, 1):
                 self.current_package = pkg
                 count += 1
                 self.show_progress(count, total, pkg, "AUR", "Instalando...")
 
-                if self.install_package(pkg, is_aur=True):
+                if self.run_command(["paru", "-Q", pkg])[0] == 0:
+                    self.show_progress(count, total, pkg, "AUR", "✓ Ya instalado")
+                    success += 1
+                elif self.install_package(pkg, is_aur=True):
                     self.show_progress(count, total, pkg, "AUR", "✓ Listo")
                     success += 1
                 else:
@@ -174,7 +239,7 @@ class PackageManager:
 
         print("\n")
         if success == total:
-            self.log("✓ Todos los paquetes instalados correctamente", "success")
+            self.log("✓ Todos los paquetes instalados correctamente", "info")
         else:
             self.log(f"✓ {success}/{total} paquetes instalados", "warning")
         return success == total
@@ -215,25 +280,12 @@ class PackageManager:
             elif option == "3":
                 self.install_packages(config["pacman"])
             elif option == "4":
-                if not config["aur"]:
-                    self.log("No hay paquetes AUR configurados", "warning")
-                    continue
                 self.install_packages([], config["aur"])
             elif option == "5":
-                self.log("\nSaliendo...", "info")
-                break
+                self.log("Saliendo...", "info")
+                sys.exit(0)
             else:
-                self.log("\nOpción inválida", "error")
-
-    def __del__(self):
-        if self.lock_file:
-            fcntl.flock(self.lock_file, fcntl.LOCK_UN)
-            self.lock_file.close()
+                self.log("Opción inválida", "warning")
 
 if __name__ == "__main__":
-    try:
-        app = PackageManager()
-        app.run()
-    except KeyboardInterrupt:
-        print(Fore.YELLOW + "\nOperación cancelada por el usuario")
-        sys.exit(1)
+    PackageManager().run()
